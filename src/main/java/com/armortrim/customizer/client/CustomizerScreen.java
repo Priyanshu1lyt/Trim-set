@@ -1,13 +1,15 @@
 package com.armortrim.customizer.client;
 
-import com.armortrim.customizer.net.ApplyPayload;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.input.KeyInput;
+import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.component.ComponentType;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.item.Item;
@@ -16,10 +18,13 @@ import net.minecraft.item.Items;
 import net.minecraft.item.equipment.trim.ArmorTrim;
 import net.minecraft.item.equipment.trim.ArmorTrimMaterial;
 import net.minecraft.item.equipment.trim.ArmorTrimPattern;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.nbt.NbtOps;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
+import net.minecraft.registry.RegistryOps;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.text.Text;
@@ -30,6 +35,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 public class CustomizerScreen extends Screen {
     private record Hit(int x1, int y1, int x2, int y2, Runnable action) {}
@@ -38,7 +44,7 @@ public class CustomizerScreen extends Screen {
     private static final int WHITE = 0xFFFFFFFF, GRAY = 0xFFAAAAAA, GREEN = 0xFF55FF55, RED = 0xFFFF5555, YELLOW = 0xFFFFFF55;
 
     private static final EquipmentSlot[] SLOTS = {EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET};
-    private static final String[] SLOT_CODES = {"HEAD", "CHEST", "LEGS", "FEET"};
+    private static final String[] SLOT_ARGS = {"armor.head", "armor.chest", "armor.legs", "armor.feet"};
     private static final String[] SLOT_NAMES = {"Helmet", "Chestplate", "Leggings", "Boots"};
 
     private static final Map<String, Item> MATERIAL_ICONS = new HashMap<>();
@@ -74,8 +80,16 @@ public class CustomizerScreen extends Screen {
     private String status = "Pick a trim, then a material.";
     private int statusColor = GRAY;
 
+    // live preview bookkeeping
     private final ItemStack[] savedStack = new ItemStack[4];
     private final ArmorTrim[] savedTrim = new ArmorTrim[4];
+
+    // pending apply (waiting for the server to answer)
+    private int pendingTicks = -1;
+    private final boolean[] pend = new boolean[4];
+    private final Identifier[] pendP = new Identifier[4];
+    private final Identifier[] pendM = new Identifier[4];
+    private final ItemStack[] pendOld = new ItemStack[4];
 
     public CustomizerScreen() {
         super(Text.literal("Armor Trim Customizer"));
@@ -143,6 +157,8 @@ public class CustomizerScreen extends Screen {
 
     private void setStatus(String s, int color) { status = s; statusColor = color; }
 
+    // ------------------------------------------------------------ live preview
+
     private void updatePreview() {
         if (client == null || client.player == null || client.world == null) return;
         for (int i = 0; i < 4; i++) {
@@ -181,6 +197,8 @@ public class CustomizerScreen extends Screen {
         super.removed();
     }
 
+    // ------------------------------------------------------------ actions
+
     private void toggleMode() {
         if (!same) {
             if (sharedP == null && sharedM == null) {
@@ -199,45 +217,109 @@ public class CustomizerScreen extends Screen {
         setStatus(same ? "One trim + material for all armor." : "Each armor piece is configured separately.", GRAY);
     }
 
+    /**
+     * Builds: item replace entity @s armor.chest with minecraft:netherite_chestplate[<ALL components, trim swapped>]
+     * Every existing component (enchantments, damage, name, lore, custom data...) is copied, so only the trim changes.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private String buildCommand(int i, ItemStack st, RegistryEntry<ArmorTrimPattern> pe, RegistryEntry<ArmorTrimMaterial> me) {
+        ItemStack copy = st.copy();
+        copy.set(DataComponentTypes.TRIM, new ArmorTrim(me, pe));
+        RegistryOps<NbtElement> ops = client.world.getRegistryManager().getOps(NbtOps.INSTANCE);
+
+        StringBuilder comps = new StringBuilder();
+        for (Map.Entry<ComponentType<?>, Optional<?>> e : copy.getComponentChanges().entrySet()) {
+            Identifier key = Registries.DATA_COMPONENT_TYPE.getId(e.getKey());
+            if (key == null) continue;
+            if (comps.length() > 0) comps.append(',');
+            if (e.getValue().isEmpty()) {
+                comps.append('!').append(key);
+                continue;
+            }
+            Codec codec = e.getKey().getCodec();
+            if (codec == null) {
+                if (comps.length() > 0) comps.setLength(comps.length() - 1);
+                continue;
+            }
+            DataResult res = codec.encodeStart(ops, e.getValue().get());
+            Object enc = res.getOrThrow();
+            comps.append(key).append('=').append(enc);
+        }
+        Identifier itemId = Registries.ITEM.getId(copy.getItem());
+        return "item replace entity @s " + SLOT_ARGS[i] + " with " + itemId
+                + (comps.length() > 0 ? "[" + comps + "]" : "");
+    }
+
     private void apply() {
-        if (client == null || client.player == null) return;
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
+        if (client == null || client.player == null || client.world == null) return;
+        if (pendingTicks >= 0) { setStatus("Please wait...", GRAY); return; }
+        ClientPlayNetworkHandler handler = client.getNetworkHandler();
+        if (handler == null) return;
+
+        List<String> cmds = new ArrayList<>();
         boolean anyArmor = false;
+        boolean[] mark = new boolean[4];
         for (int i = 0; i < 4; i++) {
             ItemStack st = client.player.getEquippedStack(SLOTS[i]);
             if (st.isEmpty()) continue;
             anyArmor = true;
             Identifier p = effP(i), m = effM(i);
             if (p == null || m == null || !trimmable(st)) continue;
-            if (n > 0) sb.append(';');
-            sb.append(SLOT_CODES[i]).append(',').append(p).append(',').append(m);
-            n++;
+            RegistryEntry<ArmorTrimPattern> pe = patternEntry(p);
+            RegistryEntry<ArmorTrimMaterial> me = materialEntry(m);
+            if (pe == null || me == null) continue;
+            cmds.add(buildCommand(i, st, pe, me));
+            mark[i] = true;
+            pendP[i] = p;
+            pendM[i] = m;
+            pendOld[i] = st;
         }
         if (!anyArmor) { setStatus("You are not wearing any armor.", RED); return; }
-        if (n == 0) { setStatus("Select a trim AND a material first.", YELLOW); return; }
-        if (!ClientPlayNetworking.canSend(ApplyPayload.ID)) {
-            setStatus("This server does not have the mod installed.", RED);
-            return;
-        }
-        ClientPlayNetworking.send(new ApplyPayload(sb.toString()));
+        if (cmds.isEmpty()) { setStatus("Select a trim AND a material first.", YELLOW); return; }
+
+        for (int i = 0; i < 4; i++) pend[i] = mark[i];
+        for (String c : cmds) handler.sendChatCommand(c);
+        pendingTicks = 0;
         setStatus("Applying...", GRAY);
     }
 
-    public void onResult(String msg) {
-        if (msg.startsWith("ok:")) {
-            String[] f = msg.split(":");
-            int applied = Integer.parseInt(f[1]);
-            for (int i = 0; i < 4; i++) { savedStack[i] = null; savedTrim[i] = null; }
-            setStatus("Applied to " + applied + " armor piece" + (applied == 1 ? "" : "s") + "!", GREEN);
-        } else if (msg.equals("err:not_op")) {
-            setStatus("Only operators can apply trims.", RED);
-        } else if (msg.equals("err:none")) {
-            setStatus("Nothing could be applied (no trimmable armor).", RED);
-        } else {
-            setStatus("Invalid request.", RED);
+    private boolean satisfied(int i) {
+        ItemStack cur = client.player.getEquippedStack(SLOTS[i]);
+        ArmorTrim t = cur.get(DataComponentTypes.TRIM);
+        return cur != pendOld[i] && t != null
+                && t.pattern().matchesId(pendP[i]) && t.material().matchesId(pendM[i]);
+    }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (pendingTicks < 0 || client == null || client.player == null) return;
+        pendingTicks++;
+        int ok = 0, total = 0;
+        for (int i = 0; i < 4; i++) {
+            if (!pend[i]) continue;
+            total++;
+            if (satisfied(i)) ok++;
+        }
+        if (total > 0 && ok == total) {
+            for (int i = 0; i < 4; i++) { savedStack[i] = null; savedTrim[i] = null; pend[i] = false; }
+            pendingTicks = -1;
+            setStatus("Applied to " + ok + " armor piece" + (ok == 1 ? "" : "s") + "!", GREEN);
+        } else if (pendingTicks > 60) {
+            for (int i = 0; i < 4; i++) {
+                if (!pend[i]) continue;
+                ItemStack cur = client.player.getEquippedStack(SLOTS[i]);
+                if (satisfied(i)) { savedStack[i] = null; savedTrim[i] = null; }
+                else if (savedStack[i] == cur) restore(i, cur);
+                pend[i] = false;
+            }
+            pendingTicks = -1;
+            if (ok == 0) setStatus("Not applied. You must be an operator (OP) on this server.", RED);
+            else setStatus("Applied to " + ok + " of " + total + " pieces.", YELLOW);
         }
     }
+
+    // ------------------------------------------------------------ rendering
 
     private void addHit(int x1, int y1, int x2, int y2, Runnable r) {
         hits.add(new Hit(x1, y1, x2, y2, r));
@@ -363,6 +445,8 @@ public class CustomizerScreen extends Screen {
         button(ctx, rx + 121, py + 214, 119, 20, "CANCEL", 0xFF7D2E2E, mx, my, this::close);
     }
 
+    // ------------------------------------------------------------ input
+
     @Override
     public boolean mouseClicked(Click click, boolean doubled) {
         if (click.button() == 0) {
@@ -394,4 +478,4 @@ public class CustomizerScreen extends Screen {
         }
         return super.keyPressed(input);
     }
-}
+            }
