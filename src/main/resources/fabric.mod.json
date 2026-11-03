@@ -3,12 +3,11 @@
   "id": "armortrimcustomizer",
   "version": "${version}",
   "name": "Armor Trim & Ore Customizer",
-  "description": "Press M to apply any vanilla armor trim + material to your worn armor. Operator only.",
-  "authors": ["Priyanshu1lyt"],
+  "description": "Press M to apply any vanilla armor trim + material to your worn armor. Works on any server where you are an operator - no server mod needed.",
+  "authors": ["NotHeartYT", "Praveen_god_67", "Nebrion"],
   "license": "MIT",
-  "environment": "*",
+  "environment": "client",
   "entrypoints": {
-    "main": ["com.armortrim.customizer.ArmorTrimCustomizer"],
     "client": ["com.armortrim.customizer.client.ArmorTrimCustomizerClient"]
   },
   "depends": {
